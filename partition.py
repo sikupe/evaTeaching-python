@@ -1,6 +1,9 @@
 import random
 from typing import TypeVar, List, Callable, Tuple
 import functools
+
+import numpy as np
+
 import utils
 
 K = 10  # number of piles
@@ -9,7 +12,8 @@ MAX_GEN = 500  # maximum number of generations
 CX_PROB = 0.8  # crossover probability
 MUT_PROB = 0.2  # mutation probability
 MUT_FLIP_PROB = 0.1  # probability of chaninging value during mutation
-REPEATS = 10  # number of runs of algorithm (should be at least 10)
+REPEATS = 10  # numb
+# er of runs of algorithm (should be at least 10)
 OUT_DIR = 'partition'  # output directory for logs
 EXP_ID = 'default'  # the ID of this experiment (used to create log names)
 
@@ -27,7 +31,7 @@ def read_weights(filename: str) -> List[int]:
 
 # computes the bin weights
 # - bins are the indices of bins into which the object belongs
-def bin_weights(weights, bins):
+def bin_weights(weights: List[int], bins: Individual) -> List[int]:
     bw = [0] * K
     for w, b in zip(weights, bins):
         bw[b] += w
@@ -39,6 +43,24 @@ def fitness(ind: Individual, weights: List[int]) -> utils.FitObjPair:
     bw = bin_weights(weights, ind)
     return utils.FitObjPair(fitness=1 / (max(bw) - min(bw) + 1),
                             objective=max(bw) - min(bw))
+
+
+def fitness_std_base(ind: Individual, weights: List[int], exponent=2) -> utils.FitObjPair:
+    bw = np.array(bin_weights(weights, ind))
+    mean_bin = sum(weights) / K
+    var = np.sum((bw - mean_bin) ** 2)
+    std = np.sqrt(var)
+    fitness = 1 / std
+    # Taking the negative variance, as we are searching for a maximum
+    return utils.FitObjPair(fitness=fitness, objective=max(bw) - min(bw))
+
+
+def fitness_std(ind: Individual, weights: List[int]) -> utils.FitObjPair:
+    return fitness_std_base(ind, weights)
+
+
+def fitness_std_modified(ind: Individual, weights: List[int]) -> utils.FitObjPair:
+    return fitness_std_base(ind, weights, 3)
 
 
 # creates the individual
@@ -54,6 +76,47 @@ def create_pop(pop_size: int, create_individual: Callable[[], Population]) -> Po
 # the roulette wheel selection
 def roulette_wheel_selection(pop: Population, fits: List[float], k) -> Population:
     return random.choices(pop, fits, k=k)
+
+
+def sus_selection(pop: Population, fits: List[float], k) -> Population:
+    total_size = sum(fits)
+    cum_fits = np.cumsum(fits)
+    step_size = total_size / k
+    start = random.uniform(0, total_size)
+    off = []
+    current_ind = 0
+    for i in range(k):
+        step = (start + i * step_size) % total_size
+
+        lower_bound = cum_fits[current_ind - 1] % total_size
+        upper_bound = cum_fits[current_ind]
+
+        while not (lower_bound < step <= upper_bound):
+            current_ind += 1
+            current_ind %= len(pop)
+            lower_bound = cum_fits[current_ind - 1] % total_size
+            upper_bound = cum_fits[current_ind]
+        off.append(pop[current_ind])
+    return off
+
+
+def tournament_selection(pop: Population, fits: List[float], offspring_size) -> Population:
+    k = 2
+
+    off = []
+    for i in range(offspring_size):
+        random_inds = [random.randint(0, len(pop) - 1) for _ in range(k)]
+
+        max_ind = None
+        max_fit = 0
+        for ind in random_inds:
+            if fits[ind] > max_fit:
+                max_ind = ind
+                max_fit = fits[ind]
+
+        off.append(pop[max_ind])
+
+    return off
 
 
 # implements the one-point crossover of two individuals
@@ -134,64 +197,69 @@ def evolutionary_algorithm(pop: Population, max_gen: int, fitness: FitnessFuncti
 if __name__ == '__main__':
     # read the weights from input
     weights = read_weights('inputs/partition-easy.txt')
+    for fit_fun in [fitness, fitness_std, fitness_std_modified]:
+        for sel_fun in [sus_selection, roulette_wheel_selection, tournament_selection]:
+            EXP_ID = f'{fit_fun.__name__.replace("_", "-")}-{sel_fun.__name__.replace("_", "-")}'
+            # use `functool.partial` to create fix some arguments of the functions
+            # and create functions with required signatures
+            cr_ind: Callable[[], Individual] = functools.partial(create_ind, ind_len=len(weights))
+            fit: FitnessFunction = functools.partial(fit_fun, weights=weights)
+            xover: Operator = functools.partial(crossover, cross=one_pt_cross, cx_prob=CX_PROB)
+            mut: Operator = functools.partial(mutation, mut_prob=MUT_PROB,
+                                              mutate=functools.partial(flip_mutate, prob=MUT_FLIP_PROB, upper=K))
 
-    # use `functool.partial` to create fix some arguments of the functions 
-    # and create functions with required signatures
-    cr_ind: Callable[[], Individual] = functools.partial(create_ind, ind_len=len(weights))
-    fit: FitnessFunction = functools.partial(fitness, weights=weights)
-    xover: Operator = functools.partial(crossover, cross=one_pt_cross, cx_prob=CX_PROB)
-    mut: Operator = functools.partial(mutation, mut_prob=MUT_PROB,
-                                      mutate=functools.partial(flip_mutate, prob=MUT_FLIP_PROB, upper=K))
+            # we can use multiprocessing to evaluate fitness in parallel
+            import multiprocessing
 
-    # we can use multiprocessing to evaluate fitness in parallel
-    import multiprocessing
+            pool = multiprocessing.Pool()
 
-    pool = multiprocessing.Pool()
+            import matplotlib.pyplot as plt
 
-    import matplotlib.pyplot as plt
+            # run the algorithm `REPEATS` times and remember the best solutions from
+            # last generations
+            best_inds = []
+            for run in range(REPEATS):
+                # initialize the log structure
+                log = utils.Log(OUT_DIR, EXP_ID, run, write_immediately=True, print_frequency=5)
+                # create population
+                pop = create_pop(POP_SIZE, cr_ind)
+                # run evolution - notice we use the pool.map as the map_fn
+                pop = evolutionary_algorithm(pop, MAX_GEN, fit, [xover, mut], sel_fun, map_fn=pool.map,
+                                             log=log)
+                # remember the best individual from last generation, save it to file
+                bi = max(pop, key=fit)
+                best_inds.append(bi)
 
-    # run the algorithm `REPEATS` times and remember the best solutions from 
-    # last generations
-    best_inds = []
-    for run in range(REPEATS):
-        # initialize the log structure
-        log = utils.Log(OUT_DIR, EXP_ID, run, write_immediately=True, print_frequency=5)
-        # create population
-        pop = create_pop(POP_SIZE, cr_ind)
-        # run evolution - notice we use the pool.map as the map_fn
-        pop = evolutionary_algorithm(pop, MAX_GEN, fit, [xover, mut], roulette_wheel_selection, map_fn=pool.map,
-                                     log=log)
-        # remember the best individual from last generation, save it to file
-        bi = max(pop, key=fit)
-        best_inds.append(bi)
+                with open(f'{OUT_DIR}/{EXP_ID}_{run}.best', 'w') as f:
+                    for w, b in zip(weights, bi):
+                        f.write(f'{w} {b}\n')
 
-        with open(f'{OUT_DIR}/{EXP_ID}_{run}.best', 'w') as f:
-            for w, b in zip(weights, bi):
-                f.write(f'{w} {b}\n')
+                # if we used write_immediately = False, we would need to save the
+                # files now
+                # log.write_files()
 
-        # if we used write_immediately = False, we would need to save the 
-        # files now
-        # log.write_files()
+            # print an overview of the best individuals from each run
+            for i, bi in enumerate(best_inds):
+                print(f'Run {i}: difference = {fit(bi).objective}, bin weights = {bin_weights(weights, bi)}')
 
-    # print an overview of the best individuals from each run
-    for i, bi in enumerate(best_inds):
-        print(f'Run {i}: difference = {fit(bi).objective}, bin weights = {bin_weights(weights, bi)}')
+            # write summary logs for the whole experiment
+            utils.summarize_experiment(OUT_DIR, EXP_ID)
 
-    # write summary logs for the whole experiment
-    utils.summarize_experiment(OUT_DIR, EXP_ID)
+            # read the summary log and plot the experiment
+            evals, lower, mean, upper = utils.get_plot_data(OUT_DIR, EXP_ID)
+            plt.figure(figsize=(12, 8))
+            utils.plot_experiment(evals, lower, mean, upper,
+                                  legend_name=f'Default settings {EXP_ID}')
+            plt.legend()
+            plt.savefig(f'partition/stats-{EXP_ID}.png')
+            plt.clf()
+            # plt.show()
 
-    # read the summary log and plot the experiment
-    evals, lower, mean, upper = utils.get_plot_data(OUT_DIR, EXP_ID)
-    plt.figure(figsize=(12, 8))
-    utils.plot_experiment(evals, lower, mean, upper, legend_name='Default settings')
-    plt.legend()
-    plt.show()
-
-    # you can also plot mutiple experiments at the same time using 
-    # utils.plot_experiments, e.g. if you have two experiments 'default' and 
-    # 'tuned' both in the 'partition' directory, you can call
-    # utils.plot_experiments('partition', ['default', 'tuned'], 
-    #                        rename_dict={'default': 'Default setting'})
-    # the rename_dict can be used to make reasonable entries in the legend - 
-    # experiments that are not in the dict use their id (in this case, the 
-    # legend entries would be 'Default settings' and 'tuned')
+            # you can also plot mutiple experiments at the same time using
+            # utils.plot_experiments, e.g. if you have two experiments 'default' and
+            # 'tuned' both in the 'partition' directory, you can call
+            # utils.plot_experiments('partition', ['default', 'tuned'],
+            #                        rename_dict={'default': 'Default setting'})
+            # the rename_dict can be used to make reasonable entries in the legend -
+            # experiments that are not in the dict use their id (in this case, the
+            # legend entries would be 'Default settings' and 'tuned')
