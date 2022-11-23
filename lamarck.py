@@ -14,8 +14,11 @@ MUT_PROB = 0.2  # mutation probability
 MUT_STEP = 0.5  # size of the mutation steps
 MUT_STD_DEV = 2.0  # standard deviation of the mutation
 MUT_DECR = 0.997231251  # decrease of standard deviation every generation (gen 0: 2.0 -> gen 500: 0.5)
+CROSS_DECR = 0.998614666  # decrease of standard deviation every generation (gen 0: 2.0 -> gen 500: 0.5)
+CR = 0.9
+F = 0.8
 REPEATS = 10  # number of runs of algorithm (should be at least 10)
-OUT_DIR = 'continuous'  # output directory for logs
+OUT_DIR = 'lamarck'  # output directory for logs
 EXP_ID = 'default'  # the ID of this experiment (used to create log names)
 
 
@@ -52,42 +55,59 @@ def one_pt_cross(p1, p2):
     return o1, o2
 
 
-def arithmetic_crossover(p1, p2):
-    t = random.uniform(0, 1)
-    np1 = np.array(p1)
-    np2 = np.array(p2)
-    o1 = np1 + t * (np2 - np1)
-    o2 = np1 + (1 - t) * (np2 - np1)
-    return o1, o2
+def gradient(ind, fitness, eps=0.0000001):
+    grad = np.zeros_like(ind)
+
+    for i in range(len(ind)):
+        x_plus = np.copy(ind)
+        x_minus = np.copy(ind)
+        x_plus[i] += eps
+        x_minus[i] -= eps
+        grad[i] = (fitness(x_plus).fitness - fitness(x_minus).fitness) / (2 * eps)
+
+    return grad
 
 
-class Mutation:
-    def next_generation(self):
-        pass
-
-
-# gaussian mutation - we need a class because we want to change the step
-# size of the mutation adaptively
-class NonAdaptiveMutation(Mutation):
-
-    def __init__(self, step_size):
+class LamarckMutation:
+    def __init__(self, fitness, step_size=.01, eps=.0000001):
+        self.eps = eps
+        self.fitness = fitness
         self.step_size = step_size
 
     def __call__(self, ind):
-        return ind + self.step_size * np.random.normal(size=ind.shape)
+        grad = gradient(ind, self.fitness, self.eps)
+        norm_grad = grad / np.linalg.norm(grad)
+        return ind - self.step_size * norm_grad
 
 
-class AdaptiveMutation(Mutation):
-    def __init__(self, step_size, deviation: float, decrease_step: float):
-        self.step_size = step_size
-        self.deviation = deviation
-        self.decease_step = decrease_step
+class DifferentialCrossover:
+    def __init__(self, CR, decrease):
+        self.CR = CR
+        self.decrease = decrease
 
     def next_generation(self):
-        self.deviation *= self.decease_step
+        self.CR *= self.decrease
 
-    def __call__(self, ind):
-        return ind + self.step_size * np.random.normal(size=ind.shape, scale=self.deviation)
+    def __call__(self, i1, i2):
+        swap = False
+        o1 = np.zeros_like(i1)
+        o2 = np.zeros_like(i2)
+        for i in range(len(i1)):
+            if random.uniform(0, 1) > self.CR:
+                swap = True
+                o1[i] = i2[i]
+                o2[i] = i1[i]
+            else:
+                o1[i] = i1[i]
+                o2[i] = i2[i]
+
+        if not swap:
+            rand_swap = random.randrange(0, len(i1))
+            tmp = o1[rand_swap]
+            o1[rand_swap] = o2[rand_swap]
+            o2[rand_swap] = tmp
+
+        return o1, o2
 
 
 # applies a list of genetic operators (functions with 1 argument - population)
@@ -134,7 +154,7 @@ def mutation(pop, mutate, mut_prob):
 #   map_fn    - function to use to map fitness evaluation over the whole 
 #               population (default `map`)
 #   log       - a utils.Log structure to log the evolution run
-def evolutionary_algorithm(pop, max_gen, fitness, operators, mate_sel, mutate_ind: Mutation, *, map_fn=map, log=None):
+def evolutionary_algorithm(pop, max_gen, fitness, operators, mate_sel, cross_ind, *, map_fn=map, log=None):
     evals = 0
     for G in range(max_gen):
         fits_objs = list(map_fn(fitness, pop))
@@ -147,7 +167,7 @@ def evolutionary_algorithm(pop, max_gen, fitness, operators, mate_sel, mutate_in
         mating_pool = mate_sel(pop, fits, POP_SIZE)
         offspring = mate(mating_pool, operators)
         pop = offspring[:]
-        mutate_ind.next_generation()
+        cross_ind.next_generation()
 
     return pop
 
@@ -165,49 +185,49 @@ if __name__ == '__main__':
                       cf.make_f10_rotated_ellipsoidal]
     fit_names = ['f01', 'f02', 'f06', 'f08', 'f10']
 
-    mut_inds = [('Original-Mutation', NonAdaptiveMutation(step_size=MUT_STEP)), ('Adaptive-Mutation', AdaptiveMutation(step_size=MUT_STEP, decrease_step=MUT_DECR, deviation=MUT_STD_DEV))]
-    crossovers = [('One-Point-Crossover', one_pt_cross), ('Arithmetic-Crossover',arithmetic_crossover)]
-    for mut_name, mut_ind in mut_inds:
-        for cross_name, x_over in crossovers:
-            for fit_gen, fit_name in zip(fit_generators, fit_names):
-                name = f'{EXP_ID}-{mut_name}-{cross_name}.{fit_name}'
-                fit = fit_gen(DIMENSION)
-                xover = functools.partial(crossover, cross=x_over, cx_prob=CX_PROB)
-                mut = functools.partial(mutation, mut_prob=MUT_PROB, mutate=mut_ind)
+    for fit_gen, fit_name in zip(fit_generators, fit_names):
+        name = f'{EXP_ID}.{fit_name}'
+        fit = fit_gen(DIMENSION)
+        d_cross = DifferentialCrossover(CR, CROSS_DECR)
+        d_mut = LamarckMutation(fit)
+        xover = functools.partial(crossover, cross=d_cross, cx_prob=CX_PROB)
+        mut = functools.partial(mutation, mut_prob=MUT_PROB, mutate=d_mut)
 
-                # run the algorithm `REPEATS` times and remember the best solutions from
-                # last generations
+        # run the algorithm `REPEATS` times and remember the best solutions from
+        # last generations
 
-                best_inds = []
-                for run in range(REPEATS):
-                    # initialize the log structure
-                    log = utils.Log(OUT_DIR, name, run,
-                                    write_immediately=True, print_frequency=5)
-                    # create population
-                    pop = create_pop(POP_SIZE, cr_ind)
-                    # run evolution - notice we use the pool.map as the map_fn
-                    pop = evolutionary_algorithm(pop, MAX_GEN, fit, [xover, mut], tournament_selection, mut_ind, map_fn=map,
-                                                 log=log)
-                    # remember the best individual from last generation, save it to file
-                    bi = max(pop, key=fit)
-                    best_inds.append(bi)
+        best_inds = []
+        for run in range(REPEATS):
+            # initialize the log structure
+            log = utils.Log(OUT_DIR, name, run,
+                            write_immediately=True, print_frequency=5)
+            # create population
+            pop = create_pop(POP_SIZE, cr_ind)
+            # run evolution - notice we use the pool.map as the map_fn
+            pop = evolutionary_algorithm(pop, MAX_GEN, fit, [xover, mut], tournament_selection,
+                                         d_cross,
+                                         map_fn=map,
+                                         log=log)
+            # remember the best individual from last generation, save it to file
+            bi = max(pop, key=fit)
+            best_inds.append(bi)
 
-                    # if we used write_immediately = False, we would need to save the
-                    # files now
-                    # log.write_files()
+            # if we used write_immediately = False, we would need to save the
+            # files now
+            # log.write_files()
 
-                # print an overview of the best individuals from each run
-                for i, bi in enumerate(best_inds):
-                    print(f'Run {i}: objective = {fit(bi).objective}')
+        # print an overview of the best individuals from each run
+        for i, bi in enumerate(best_inds):
+            print(f'Run {i}: objective = {fit(bi).objective}')
 
-                # write summary logs for the whole experiment
-                utils.summarize_experiment(OUT_DIR, name)
+        # write summary logs for the whole experiment
+        utils.summarize_experiment(OUT_DIR, name)
 
-                # read the summary log and plot the experiment
-                evals, lower, mean, upper = utils.get_plot_data(OUT_DIR, name)
-                utils.plot_experiment(evals, lower, mean, upper,
-                                      legend_name=f'Default settings {name}')
-            plt.yscale('log')
-            plt.legend()
-            plt.savefig(f'continuous/stats-combined-{mut_name}-{cross_name}.png')
-            plt.clf()
+        # read the summary log and plot the experiment
+        evals, lower, mean, upper = utils.get_plot_data(OUT_DIR, name)
+        utils.plot_experiment(evals, lower, mean, upper,
+                              legend_name=f'Default settings {name}')
+    plt.yscale('log')
+    plt.legend()
+    plt.savefig(f'{OUT_DIR}/stats-combined.png')
+    plt.clf()
